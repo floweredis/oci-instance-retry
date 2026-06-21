@@ -1,0 +1,64 @@
+name: OCI Instance Retry
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+jobs:
+  create-instance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: OCI CLI 설치
+        run: pip install oci-cli --quiet
+
+      - name: OCI 인증 설정
+        run: |
+          mkdir -p ~/.oci
+          echo "${{ secrets.OCI_PRIVATE_KEY }}" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+          cat > ~/.oci/config << EOF
+          [DEFAULT]
+          user=${{ secrets.OCI_USER_OCID }}
+          fingerprint=${{ secrets.OCI_FINGERPRINT }}
+          tenancy=${{ secrets.OCI_TENANCY_OCID }}
+          region=${{ secrets.OCI_REGION }}
+          key_file=/home/runner/.oci/oci_api_key.pem
+          EOF
+
+      - name: ORM Apply Job 실행
+        run: |
+          echo "시도 시작: $(date)"
+
+          JOB_JSON=$(oci resource-manager job create-apply-job \
+            --stack-id "${{ secrets.OCI_STACK_ID }}" \
+            --execution-plan-strategy AUTO_APPROVED \
+            2>&1)
+
+          if echo "$JOB_JSON" | grep -q "ServiceError"; then
+            echo "❌ Job 생성 실패:"
+            echo "$JOB_JSON" | grep -i "message"
+            exit 1
+          fi
+
+          JOB_ID=$(echo "$JOB_JSON" | grep '"id"' | head -1 | awk -F'"' '{print $4}')
+          echo "✅ Job 생성 완료: $JOB_ID"
+
+          for i in $(seq 1 40); do
+            sleep 20
+            STATUS=$(oci resource-manager job get \
+              --job-id "$JOB_ID" \
+              --query "data.\"lifecycle-state\"" \
+              --raw-output)
+            echo "  [$(date '+%H:%M:%S')] 상태: $STATUS"
+
+            if [ "$STATUS" = "SUCCEEDED" ]; then
+              echo "🎉 인스턴스 생성 성공!"
+              exit 0
+            elif [ "$STATUS" = "FAILED" ] || [ "$STATUS" = "CANCELED" ]; then
+              echo "❌ 이번 시도 실패. 30분 후 자동 재시도됩니다."
+              exit 1
+            fi
+          done
