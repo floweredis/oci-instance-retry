@@ -27,6 +27,15 @@ jobs:
           region=${{ secrets.OCI_REGION }}
           key_file=/home/runner/.oci/oci_api_key.pem
           EOF
+          echo "=== config 확인 ==="
+          cat ~/.oci/config
+          echo "=== pem 파일 존재 확인 ==="
+          ls -la ~/.oci/
+
+      - name: OCI CLI 인증 테스트
+        run: |
+          echo "=== OCI CLI 테스트 ==="
+          oci iam region list 2>&1
 
       - name: ORM Apply Job 실행
         run: |
@@ -36,6 +45,9 @@ jobs:
             --stack-id "${{ secrets.OCI_STACK_ID }}" \
             --execution-plan-strategy AUTO_APPROVED \
             2>&1)
+
+          echo "=== 전체 응답 ==="
+          echo "$JOB_JSON"
 
           if echo "$JOB_JSON" | grep -q "ServiceError"; then
             echo "❌ Job 생성 실패:"
