@@ -1,12 +1,20 @@
 name: OCI Instance Retry
 on:
   schedule:
-    - cron: '*/30 * * * *'
+    - cron: '*/10 * * * *'        # ← 10분 간격
   workflow_dispatch:
+concurrency:                       # ← 추가: 동시 실행 방지(한 번에 하나만)
+  group: oci-retry
+  cancel-in-progress: false
 jobs:
   create-instance:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      actions: write
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - name: OCI CLI 설치
         run: pip install oci-cli --quiet
@@ -23,7 +31,7 @@ jobs:
           region=${{ secrets.OCI_REGION }}
           key_file=/home/runner/.oci/oci_api_key.pem
           EOF
-          chmod 600 ~/.oci/config          # ← 추가: 권한 경고 제거
+          chmod 600 ~/.oci/config
           echo "=== config 확인 ==="
           cat ~/.oci/config
           echo "=== pem 파일 존재 확인 ==="
@@ -32,6 +40,20 @@ jobs:
         run: |
           echo "=== OCI CLI 테스트 ==="
           oci iam region list 2>&1
+      - name: 이미 생성됐는지 확인 (가드)
+        run: |
+          COMP="${{ secrets.OCI_TENANCY_OCID }}"    # 인스턴스가 만들어지는 컴파트먼트 (루트 기준)
+          COUNT=$(oci compute instance list --compartment-id "$COMP" \
+            --query "length(data[?\"lifecycle-state\" != 'TERMINATED'])" \
+            --raw-output 2>/dev/null || echo 0)
+          [ -z "$COUNT" ] && COUNT=0
+          echo "현재 살아있는 인스턴스 수: $COUNT"
+          if [ "$COUNT" -gt 0 ] 2>/dev/null; then
+            echo "✅ 이미 인스턴스가 존재 → 재시도 중단 및 워크플로 비활성화"
+            gh workflow disable "OCI Instance Retry" || echo "(비활성화 권한 없음 - 수동으로 꺼주세요)"
+            exit 0
+          fi
+          echo "생성된 인스턴스 없음 → 재시도 진행"
       - name: ORM Apply Job 실행
         run: |
           echo "시도 시작: $(date)"
@@ -57,19 +79,21 @@ jobs:
             echo "  [$(date '+%H:%M:%S')] 상태: $STATUS"
             if [ "$STATUS" = "SUCCEEDED" ]; then
               echo "🎉 인스턴스 생성 성공!"
+              echo "재시도 중단을 위해 워크플로를 비활성화합니다."
+              gh workflow disable "OCI Instance Retry" || echo "(비활성화 권한 없음 - 수동으로 꺼주세요)"
               exit 0
             elif [ "$STATUS" = "FAILED" ] || [ "$STATUS" = "CANCELED" ]; then
               echo "❌ 이번 시도 실패. 상세 로그를 출력합니다."
-              echo "===== ORM Job 전체 로그 ====="                      # ← 추가
+              echo "===== ORM Job 전체 로그 ====="
               oci resource-manager job get-job-logs-content \
-                --job-id "$JOB_ID" 2>&1                                  # ← 추가
-              echo "===== 실패 원인 키워드 추출 ====="                   # ← 추가
+                --job-id "$JOB_ID" 2>&1
+              echo "===== 실패 원인 키워드 추출 ====="
               oci resource-manager job get-job-logs-content \
                 --job-id "$JOB_ID" 2>&1 \
-                | grep -iE "capacity|error|limit|denied|quota|out of host" || true   # ← 추가
-              echo "30분 후 자동 재시도됩니다."
+                | grep -iE "capacity|error|limit|denied|quota|out of host" || true
+              echo "10분 후 자동 재시도됩니다."
               exit 1
             fi
           done
-          echo "⏱️ 시간 내 종료 상태 미확인. 마지막 로그 출력:"          # ← 추가(타임아웃 대비)
+          echo "⏱️ 시간 내 종료 상태 미확인. 마지막 로그 출력:"
           oci resource-manager job get-job-logs-content --job-id "$JOB_ID" 2>&1 | tail -50
