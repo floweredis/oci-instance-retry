@@ -1,9 +1,9 @@
 name: OCI Instance Retry
 on:
   schedule:
-    - cron: '*/10 * * * *'        # ← 10분 간격
+    - cron: '*/10 * * * *'
   workflow_dispatch:
-concurrency:                       # ← 추가: 동시 실행 방지(한 번에 하나만)
+concurrency:
   group: oci-retry
   cancel-in-progress: false
 jobs:
@@ -15,6 +15,7 @@ jobs:
       contents: read
     env:
       GH_TOKEN: ${{ github.token }}
+      OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
     steps:
       - name: OCI CLI 설치
         run: pip install oci-cli --quiet
@@ -32,17 +33,18 @@ jobs:
           key_file=/home/runner/.oci/oci_api_key.pem
           EOF
           chmod 600 ~/.oci/config
-          echo "=== config 확인 ==="
-          cat ~/.oci/config
-          echo "=== pem 파일 존재 확인 ==="
-          ls -la ~/.oci/
+          echo "✅ OCI 인증 설정 완료"
       - name: OCI CLI 인증 테스트
         run: |
-          echo "=== OCI CLI 테스트 ==="
-          oci iam region list 2>&1
+          if oci iam region list >/dev/null 2>&1; then
+            echo "✅ 인증 정상"
+          else
+            echo "❌ 인증 실패"
+            exit 1
+          fi
       - name: 이미 생성됐는지 확인 (가드)
         run: |
-          COMP="${{ secrets.OCI_TENANCY_OCID }}"    # 인스턴스가 만들어지는 컴파트먼트 (루트 기준)
+          COMP="${{ secrets.OCI_TENANCY_OCID }}"
           COUNT=$(oci compute instance list --compartment-id "$COMP" \
             --query "length(data[?\"lifecycle-state\" != 'TERMINATED'])" \
             --raw-output 2>/dev/null || echo 0)
@@ -61,15 +63,13 @@ jobs:
             --stack-id "${{ secrets.OCI_STACK_ID }}" \
             --execution-plan-strategy AUTO_APPROVED \
             2>&1)
-          echo "=== 전체 응답 ==="
-          echo "$JOB_JSON"
           if echo "$JOB_JSON" | grep -q "ServiceError"; then
             echo "❌ Job 생성 실패:"
             echo "$JOB_JSON" | grep -i "message"
             exit 1
           fi
           JOB_ID=$(echo "$JOB_JSON" | grep '"id"' | head -1 | awk -F'"' '{print $4}')
-          echo "✅ Job 생성 완료: $JOB_ID"
+          echo "✅ Apply Job 생성 완료"
           for i in $(seq 1 40); do
             sleep 20
             STATUS=$(oci resource-manager job get \
@@ -83,17 +83,13 @@ jobs:
               gh workflow disable "OCI Instance Retry" || echo "(비활성화 권한 없음 - 수동으로 꺼주세요)"
               exit 0
             elif [ "$STATUS" = "FAILED" ] || [ "$STATUS" = "CANCELED" ]; then
-              echo "❌ 이번 시도 실패. 상세 로그를 출력합니다."
-              echo "===== ORM Job 전체 로그 ====="
-              oci resource-manager job get-job-logs-content \
-                --job-id "$JOB_ID" 2>&1
-              echo "===== 실패 원인 키워드 추출 ====="
+              echo "❌ 이번 시도 실패. 실패 원인:"
               oci resource-manager job get-job-logs-content \
                 --job-id "$JOB_ID" 2>&1 \
-                | grep -iE "capacity|error|limit|denied|quota|out of host" || true
+                | grep -iE "capacity|error|limit|denied|quota|out of host" \
+                || echo "(키워드 미발견 - 전체 로그는 OCI 콘솔에서 확인)"
               echo "10분 후 자동 재시도됩니다."
               exit 1
             fi
           done
-          echo "⏱️ 시간 내 종료 상태 미확인. 마지막 로그 출력:"
-          oci resource-manager job get-job-logs-content --job-id "$JOB_ID" 2>&1 | tail -50
+          echo "⏱️ 시간 내 종료 상태 미확인."
